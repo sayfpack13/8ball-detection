@@ -1,0 +1,748 @@
+import cv2
+import numpy as np
+import math
+import sys # Needed for sys.float_info.epsilon
+
+# --- Constants ---
+# Table Detection
+TABLE_LOWER_BLUE = np.array([90, 50, 50])
+TABLE_UPPER_BLUE = np.array([130, 255, 255])
+TABLE_CONTOUR_APPROX_EPSILON = 0.02
+TABLE_BORDER_SHRINK_PIXELS = 12 # Pixels to shrink bounding box from each side
+
+# Ball Detection (General)
+BALL_LOWER_HSV = np.array([0, 100, 100]) # Broad range for colored balls
+BALL_UPPER_HSV = np.array([180, 255, 255])
+BALL_GAUSSIAN_BLUR_KERNEL = (5, 5)
+BALL_HOUGH_DP = 1
+BALL_HOUGH_MIN_DIST = 20
+BALL_HOUGH_PARAM1 = 40
+BALL_HOUGH_PARAM2 = 10
+BALL_HOUGH_MIN_RADIUS = 9
+BALL_HOUGH_MAX_RADIUS = 13
+DEFAULT_BALL_RADIUS = 11 # Used when Hough doesn't return radius or for simulation
+
+# White Ball Detection
+WHITE_BALL_LOWER_HSV = np.array([0, 0, 150])
+WHITE_BALL_UPPER_HSV = np.array([180, 50, 255])
+WHITE_BALL_HOUGH_PARAM1 = 40
+WHITE_BALL_HOUGH_PARAM2 = 15
+WHITE_BALL_HOUGH_MIN_RADIUS = 8
+WHITE_BALL_HOUGH_MAX_RADIUS = 12
+
+# Cue Stick Detection
+CUE_ROI_SIZE = 50
+CUE_LOWER_WHITE = np.array([0, 0, 150]) # Similar to white ball, maybe adjust
+CUE_UPPER_WHITE = np.array([180, 50, 255])
+CUE_CANNY_LOW_THRESH = 50
+CUE_CANNY_HIGH_THRESH = 150
+CUE_HOUGH_RHO = 1
+CUE_HOUGH_THETA = np.pi / 180
+CUE_HOUGH_THRESHOLD = 10
+CUE_HOUGH_MIN_LINE_LENGTH = 20
+CUE_HOUGH_MAX_LINE_GAP = 10
+CUE_STICK_DRAW_LENGTH = 50 # Visual length to draw the cue direction line
+
+# Simulation
+SIM_STEP_SIZE = 2
+SIM_MAX_STEPS_TRAJECTORY = 200
+SIM_MAX_STEPS_MOVEMENT = 100
+# Increased tolerance for perpendicular distance check in find_target_ball
+SIM_TARGET_PERP_DIST_FACTOR = 1.5 # Revert from 10.0, maybe try 1.5
+SIM_BALL_DISTANCE_THRESHOLD_FACTOR = 2.0
+SIM_WALL_COLLISION_OFFSET = 1 # Small offset after wall bounce
+SIM_MOVEMENT_DAMPING = 0.98
+SIM_MIN_SPEED_THRESHOLD = 0.5
+
+# Drawing
+RECT_COLOR = (0, 255, 0) # Green
+RECT_THICKNESS = 3
+BALL_COLOR = (0, 0, 255) # Red
+BALL_THICKNESS = 2
+CROSSHAIR_COLOR = (0, 255, 0) # Green
+CROSSHAIR_THICKNESS = 2
+TARGET_CROSSHAIR_COLOR = (255, 0, 255) # Magenta for target ball
+CUE_STICK_COLOR = (0, 255, 0) # Green
+CUE_STICK_THICKNESS = 2
+CUE_DEBUG_LINE_COLOR = (255, 0, 0) # Blue
+CUE_DEBUG_LINE_THICKNESS = 1
+TRAJECTORY_COLOR = (0, 255, 255) # Yellow
+TRAJECTORY_THICKNESS = 2
+REFLECTION_COLOR = (255, 0, 255) # Magenta
+REFLECTION_THICKNESS = 2
+# --- End Constants ---
+
+def load_image(image_path):
+    """Loads an image from the specified path."""
+    image = cv2.imread(image_path)
+    if image is None:
+        raise ValueError(f"Could not load image from path: {image_path}")
+    return image
+
+def detect_inner_blue_area(image):
+    """Detects the largest blue area (table) and returns its inner bounding box."""
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, TABLE_LOWER_BLUE, TABLE_UPPER_BLUE)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        raise ValueError("No blue area found in the image.")
+
+    largest_contour = max(contours, key=cv2.contourArea)
+    epsilon = TABLE_CONTOUR_APPROX_EPSILON * cv2.arcLength(largest_contour, True)
+    approx = cv2.approxPolyDP(largest_contour, epsilon, True)
+    x, y, w, h = cv2.boundingRect(approx)
+
+    # Shrink the bounding box slightly to get the inner playing area
+    inner_x1 = x + TABLE_BORDER_SHRINK_PIXELS
+    inner_y1 = y + TABLE_BORDER_SHRINK_PIXELS
+    inner_x2 = x + w - TABLE_BORDER_SHRINK_PIXELS
+    inner_y2 = y + h - TABLE_BORDER_SHRINK_PIXELS
+
+    # Ensure coordinates are valid after shrinking
+    if inner_x1 >= inner_x2 or inner_y1 >= inner_y2:
+         raise ValueError("Blue area detected is too small or shrinking factor is too large.")
+
+    return inner_x1, inner_y1, inner_x2, inner_y2
+
+def draw_rectangle(image, x1, y1, x2, y2, color=RECT_COLOR, thickness=RECT_THICKNESS):
+    """Draws a rectangle on the image."""
+    cv2.rectangle(image, (x1, y1), (x2, y2), color, thickness)
+    # No need to return image, modification happens in place
+
+def detect_balls(image, roi_x1, roi_y1, roi_x2, roi_y2):
+    """Detects colored balls within a specified ROI using Hough Circles."""
+    roi = image[roi_y1:roi_y2, roi_x1:roi_x2]
+    if roi.size == 0: return [] # Handle empty ROI
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, BALL_LOWER_HSV, BALL_UPPER_HSV)
+    blurred = cv2.GaussianBlur(mask, BALL_GAUSSIAN_BLUR_KERNEL, 0)
+    circles = cv2.HoughCircles(blurred, cv2.HOUGH_GRADIENT, BALL_HOUGH_DP, BALL_HOUGH_MIN_DIST,
+                               param1=BALL_HOUGH_PARAM1, param2=BALL_HOUGH_PARAM2,
+                               minRadius=BALL_HOUGH_MIN_RADIUS, maxRadius=BALL_HOUGH_MAX_RADIUS)
+    if circles is not None:
+        # Convert to list of tuples with standard Python integers
+        circles_int = []
+        for c in np.around(circles[0, :]): # Loop through detected circles
+            # c will be like [x, y, r] as floats after around
+            circles_int.append(tuple(map(int, c))) # Convert x, y, r to int and make tuple
+        return circles_int # Return list of tuples: [(x,y,r), (x,y,r), ...]
+    else:
+        return []
+
+
+def detect_white_ball(image, roi_x1, roi_y1, roi_x2, roi_y2):
+    """Detects the white ball within a specified ROI using Hough Circles."""
+    roi = image[roi_y1:roi_y2, roi_x1:roi_x2]
+    if roi.size == 0: return None # Handle empty ROI
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, WHITE_BALL_LOWER_HSV, WHITE_BALL_UPPER_HSV)
+    blurred = cv2.GaussianBlur(mask, BALL_GAUSSIAN_BLUR_KERNEL, 0)
+    circles = cv2.HoughCircles(blurred, cv2.HOUGH_GRADIENT, BALL_HOUGH_DP, BALL_HOUGH_MIN_DIST,
+                               param1=WHITE_BALL_HOUGH_PARAM1, param2=WHITE_BALL_HOUGH_PARAM2,
+                               minRadius=WHITE_BALL_HOUGH_MIN_RADIUS, maxRadius=WHITE_BALL_HOUGH_MAX_RADIUS)
+    if circles is not None:
+        # Convert the first detected circle to a tuple of standard Python integers
+        # circles[0, 0] is the [x, y, r] array for the first circle
+        circle_data = tuple(map(int, np.around(circles[0, 0]))) # Convert x, y, r to int
+        return circle_data # Return tuple: (x, y, r)
+    else:
+        return None
+
+
+def draw_detected_balls(image, balls_roi, roi_x1, roi_y1, color=BALL_COLOR, thickness=BALL_THICKNESS):
+    """Draws circles for detected balls, adjusting for ROI offset."""
+    # balls_roi is expected to be a list of tuples [(x_roi, y_roi, r), ...] with standard ints
+    for ball in balls_roi:
+        cx_roi, cy_roi, r = ball
+        # Convert ROI coordinates to global image coordinates
+        cx_global = cx_roi + roi_x1
+        cy_global = cy_roi + roi_y1
+        cv2.circle(image, (cx_global, cy_global), r, color, thickness)
+
+def draw_crosshair(image, center, radius=DEFAULT_BALL_RADIUS, color=CROSSHAIR_COLOR, thickness=CROSSHAIR_THICKNESS):
+    """Draws a crosshair marker at the given center."""
+    cx, cy = map(int, center) # Ensure integer coordinates
+    r = int(radius)
+    cv2.circle(image, (cx, cy), r, color, thickness)
+    cv2.line(image, (cx - r, cy), (cx + r, cy), color, thickness)
+    cv2.line(image, (cx, cy - r), (cx, cy + r), color, thickness)
+
+def detect_cue_stick(image, white_ball_center):
+    """
+    Detects the cue stick direction based on lines near the white ball.
+    Returns a tuple of (start_point, end_point_direction) or None.
+    Start_point is the white ball center. End_point indicates direction.
+    Points are returned as tuples of standard Python ints.
+    """
+    if white_ball_center is None:
+        return None
+
+    half_size = CUE_ROI_SIZE // 2
+    # Ensure white_ball_center coords are standard ints for slicing/ROI calc
+    x_wb, y_wb = map(int, white_ball_center)
+
+    # Define ROI around the white ball center
+    roi_y1 = max(0, y_wb - half_size)
+    roi_y2 = min(image.shape[0], y_wb + half_size)
+    roi_x1 = max(0, x_wb - half_size)
+    roi_x2 = min(image.shape[1], x_wb + half_size)
+
+    roi_stick = image[roi_y1:roi_y2, roi_x1:roi_x2]
+
+    # Check if ROI is valid before processing
+    if roi_stick.size == 0:
+        print("Warning: Cue stick ROI is empty (white ball near edge?).")
+        return None
+
+    # Detect white lines within the ROI
+    hsv_roi = cv2.cvtColor(roi_stick, cv2.COLOR_BGR2HSV)
+    mask_white = cv2.inRange(hsv_roi, CUE_LOWER_WHITE, CUE_UPPER_WHITE)
+    edges = cv2.Canny(mask_white, CUE_CANNY_LOW_THRESH, CUE_CANNY_HIGH_THRESH, apertureSize=3)
+    lines = cv2.HoughLinesP(edges, CUE_HOUGH_RHO, CUE_HOUGH_THETA,
+                            threshold=CUE_HOUGH_THRESHOLD,
+                            minLineLength=CUE_HOUGH_MIN_LINE_LENGTH,
+                            maxLineGap=CUE_HOUGH_MAX_LINE_GAP)
+
+    if lines is not None:
+        center_roi_x = x_wb - roi_x1
+        center_roi_y = y_wb - roi_y1
+        best_line_global = None
+        min_dist_sq = float('inf') # Use squared distance to avoid sqrt
+
+        for line in lines:
+            x1_roi, y1_roi, x2_roi, y2_roi = line[0] # These are standard ints from HoughLinesP
+
+            # Calculate distance from line segment endpoints to ROI center
+            dist_start_sq = (x1_roi - center_roi_x)**2 + (y1_roi - center_roi_y)**2
+            dist_end_sq = (x2_roi - center_roi_x)**2 + (y2_roi - center_roi_y)**2
+            current_min_dist_sq = min(dist_start_sq, dist_end_sq)
+
+            if current_min_dist_sq < min_dist_sq:
+                min_dist_sq = current_min_dist_sq
+                # Store the line segment in global image coordinates (as standard ints)
+                best_line_global = (x1_roi + roi_x1, y1_roi + roi_y1, x2_roi + roi_x1, y2_roi + roi_y1)
+
+        if best_line_global:
+            x1_g, y1_g, x2_g, y2_g = best_line_global
+
+            # Use floats for intermediate angle calculation
+            xf_wb, yf_wb = float(x_wb), float(y_wb)
+            xf1_g, yf1_g = float(x1_g), float(y1_g)
+            xf2_g, yf2_g = float(x2_g), float(y2_g)
+
+            dist_sq_1 = (xf1_g - xf_wb)**2 + (yf1_g - yf_wb)**2
+            dist_sq_2 = (xf2_g - xf_wb)**2 + (yf2_g - yf_wb)**2
+
+            # Angle based on point further from white ball center
+            if dist_sq_1 > dist_sq_2:
+                angle = math.atan2(yf1_g - yf_wb, xf1_g - xf_wb)
+            else:
+                angle = math.atan2(yf2_g - yf_wb, xf2_g - xf_wb)
+
+            # Calculate an endpoint for drawing/visualization based on the angle
+            cue_stick_end_x = int(xf_wb + float(CUE_STICK_DRAW_LENGTH) * math.cos(angle))
+            cue_stick_end_y = int(yf_wb + float(CUE_STICK_DRAW_LENGTH) * math.sin(angle))
+
+            # Return the white ball center (int tuple) and the calculated direction endpoint (int tuple)
+            return (x_wb, y_wb), (cue_stick_end_x, cue_stick_end_y)
+
+    # No suitable line found
+    return None
+
+
+def distance(p1, p2):
+    """Calculates Euclidean distance between two points (x, y) using standard numbers."""
+    # Inputs p1, p2 are expected to be tuples of int or float
+    dx = float(p1[0]) - float(p2[0]) # Use float for intermediate calculations
+    dy = float(p1[1]) - float(p2[1])
+    if abs(dx) > 1e10 or abs(dy) > 1e10: # Basic check against enormous values from bad input
+        print(f"Warning: Large difference encountered in distance calc: dx={dx}, dy={dy}")
+        return float('inf')
+    try:
+        dist_sq = dx**2 + dy**2
+        return math.sqrt(dist_sq)
+    except ValueError: # Handles case where dist_sq might be negative due to float precision issues? Unlikely here.
+         print(f"Warning: ValueError in distance sqrt for dx^2+dy^2 = {dist_sq}")
+         return float('inf')
+    except OverflowError: # Should be rare with standard floats but possible
+        print(f"Warning: OverflowError in distance calculation for dx^2+dy^2 = {dist_sq}")
+        return float('inf')
+
+def find_target_ball(cue_ball_center, cue_stick_direction_point, balls_data, ball_radius=DEFAULT_BALL_RADIUS):
+    """
+    Finds the most likely target ball based on cue direction.
+    balls_data: List of tuples [(x, y, r), ...] in global coordinates (standard ints).
+    Returns the data tuple (x, y, r) of the target ball or None (standard ints).
+    """
+    if cue_ball_center is None or cue_stick_direction_point is None or not balls_data:
+        return None
+
+    # Ensure inputs are standard numbers (float) for calculations
+    cue_x, cue_y = map(float, cue_ball_center)
+    dir_pt_x, dir_pt_y = map(float, cue_stick_direction_point)
+
+    dir_x = dir_pt_x - cue_x
+    dir_y = dir_pt_y - cue_y
+
+    norm = math.sqrt(dir_x**2 + dir_y**2)
+    if norm < sys.float_info.epsilon:
+        print("Warning: Cue stick direction vector has zero length.")
+        return None
+
+    # Use float arrays for vector math
+    direction_unit = np.array([dir_x / norm, dir_y / norm], dtype=float)
+    cue_ball_center_np = np.array([cue_x, cue_y], dtype=float)
+
+    closest_target = None
+    min_proj_dist = float('inf') # Find the ball closest along the projected path
+
+    print(f"Finding target from cue @ ({int(cue_x)}, {int(cue_y)}) towards ({int(dir_pt_x)}, {int(dir_pt_y)})") # Use int for cleaner print
+
+    for ball_data in balls_data: # ball_data contains standard ints (x, y, r)
+        # Ensure ball data uses float for calculations
+        bx, by, br = map(float, ball_data)
+        target_center_np = np.array([bx, by], dtype=float)
+        vector_to_target = target_center_np - cue_ball_center_np
+        distance_to_target_center = np.linalg.norm(vector_to_target)
+
+        # Dot product (projection distance along direction_unit)
+        dot_product = np.dot(vector_to_target, direction_unit)
+
+        # Perpendicular distance from ball center to the infinite line defined by cue direction
+        perp_dist = abs(vector_to_target[0] * direction_unit[1] - vector_to_target[1] * direction_unit[0])
+
+        # Define thresholds using float ball_radius
+        f_ball_radius = float(ball_radius)
+        # Use the perpendicular distance factor constant
+        collision_threshold_perp = (f_ball_radius + br) * SIM_TARGET_PERP_DIST_FACTOR
+        distance_threshold_min = (f_ball_radius + br) * SIM_BALL_DISTANCE_THRESHOLD_FACTOR
+
+        # --- Detailed Debug Print ---
+        print(f"  Checking Ball @ ({int(bx)},{int(by)}), R={int(br)}:")
+        print(f"    Dist Cue->Ball = {distance_to_target_center:.2f}")
+        print(f"    Dot Prod (Forward Check) = {dot_product:.2f} (>0?)")
+        # Show the check being performed:
+        print(f"    Perp Dist = {perp_dist:.2f}. Is it < {collision_threshold_perp:.2f}? ({perp_dist < collision_threshold_perp})")
+        print(f"    Dist Check = {distance_to_target_center:.2f}. Is it > {distance_threshold_min:.2f}? ({distance_to_target_center > distance_threshold_min})")
+        # --- End Detailed Debug Print ---
+
+        if (dot_product > 0 and
+            perp_dist < collision_threshold_perp and
+            distance_to_target_center > distance_threshold_min):
+
+            print(f"    -> PASSED CHECKS!") # Debug Pass
+            if dot_product < min_proj_dist:
+                min_proj_dist = dot_product
+                closest_target = ball_data # Store original tuple (int)
+                print(f"    -> *New Closest Candidate*") # Debug Candidate
+        # else: # Optional: More detailed fail reason
+        #     fail_reason = []
+        #     if not dot_product > 0: fail_reason.append("Behind Cue")
+        #     if not perp_dist < collision_threshold_perp: fail_reason.append(f"Too Far Sideways (Dist {perp_dist:.2f} >= Threshold {collision_threshold_perp:.2f})")
+        #     if not distance_to_target_center > distance_threshold_min: fail_reason.append("Too Close to Cue")
+        #     print(f"    -> FAILED CHECKS ({', '.join(fail_reason)})")
+
+
+    if closest_target:
+         # Print using int for clarity
+         print(f"  Target Found: Ball @ ({int(closest_target[0])},{int(closest_target[1])})")
+    else:
+         print(f"  No suitable target found after checking all balls.")
+
+    # Return the data as tuple of ints if found
+    return tuple(map(int, closest_target)) if closest_target else None
+
+def simulate_trajectory(start_point, direction_point, table_x1, table_y1, table_x2, table_y2, other_balls_data, ball_radius=DEFAULT_BALL_RADIUS, max_steps=SIM_MAX_STEPS_TRAJECTORY):
+    """
+    Simulates cue ball trajectory towards a direction, handling wall bounces
+    and stopping at the first collision with another ball.
+    start_point: (x, y) tuple for the cue ball start (ints).
+    direction_point: (x, y) tuple indicating direction (ints).
+    other_balls_data: List of tuples [(x, y, r), ...] for collision checks (ints).
+    Returns a list of points [(x, y), ...] representing the trajectory path (ints).
+    """
+    trajectory = [start_point] # Store path as ints
+    # Use float for simulation steps
+    current_x, current_y = map(float, start_point)
+    dir_pt_x, dir_pt_y = map(float, direction_point)
+    f_ball_radius = float(ball_radius)
+
+    dir_x = dir_pt_x - current_x
+    dir_y = dir_pt_y - current_y
+
+    norm = math.sqrt(dir_x**2 + dir_y**2)
+    if norm < sys.float_info.epsilon: return trajectory # No movement if direction is same as start
+
+    # Normalized direction vector for stepping
+    step_dx = float(SIM_STEP_SIZE) * dir_x / norm
+    step_dy = float(SIM_STEP_SIZE) * dir_y / norm
+
+    # Use float table boundaries for comparisons
+    f_table_x1 = float(table_x1)
+    f_table_y1 = float(table_y1)
+    f_table_x2 = float(table_x2)
+    f_table_y2 = float(table_y2)
+
+    for _ in range(max_steps):
+        next_x, next_y = current_x + step_dx, current_y + step_dy
+
+        # --- Check for collision with table boundaries (walls) ---
+        bounce = False
+        if next_x < f_table_x1 + f_ball_radius:
+            step_dx *= -1.0 # Reverse X direction
+            next_x = f_table_x1 + f_ball_radius + float(SIM_WALL_COLLISION_OFFSET) # Move slightly away
+            bounce = True
+        elif next_x > f_table_x2 - f_ball_radius:
+            step_dx *= -1.0
+            next_x = f_table_x2 - f_ball_radius - float(SIM_WALL_COLLISION_OFFSET)
+            bounce = True
+
+        if next_y < f_table_y1 + f_ball_radius:
+            step_dy *= -1.0 # Reverse Y direction
+            next_y = f_table_y1 + f_ball_radius + float(SIM_WALL_COLLISION_OFFSET)
+            bounce = True
+        elif next_y > f_table_y2 - f_ball_radius:
+            step_dy *= -1.0
+            next_y = f_table_y2 - f_ball_radius - float(SIM_WALL_COLLISION_OFFSET)
+            bounce = True
+
+        # Update position *after* bounce adjustments for the current step if bounce occurred
+        if bounce:
+             current_x, current_y = next_x, next_y
+             trajectory.append((int(current_x), int(current_y)))
+             continue # Recalculate next step with new direction
+
+
+        # --- Check for collision with other balls ---
+        collision_detected = False
+        collision_point = None
+        for ball_data in other_balls_data: # ball_data has (int x, int y, int r)
+            bx, by, br = map(float, ball_data) # Use float for comparison
+            f_br = float(br)
+            dist_sq = (next_x - bx)**2 + (next_y - by)**2
+            # Collision if distance between centers is less than sum of radii
+            if dist_sq <= (f_ball_radius + f_br)**2 * 0.95: # Use factor < 1 to ensure collision before overlap
+                collision_detected = True
+                # Stop trajectory just before collision point for visualization
+                collision_point = (int(current_x), int(current_y))
+                break
+
+        if collision_detected:
+            if collision_point: trajectory.append(collision_point)
+            break # Stop the trajectory simulation at the point of collision
+
+        # --- Update position and add to trajectory ---
+        current_x, current_y = next_x, next_y
+        trajectory.append((int(current_x), int(current_y)))
+
+    return trajectory
+
+def draw_trajectory(image, points, color=TRAJECTORY_COLOR, thickness=TRAJECTORY_THICKNESS):
+    """Draws a trajectory path consisting of connected line segments."""
+    if len(points) > 1:
+        for i in range(len(points) - 1):
+            # Ensure points are integer tuples for drawing (should be already)
+            p1 = tuple(map(int, points[i]))
+            p2 = tuple(map(int, points[i+1]))
+            cv2.line(image, p1, p2, color, thickness)
+
+
+def handle_collision(ball1_pos_rad, ball2_pos_rad, initial_velocity_ball1=(10.0, 0.0)):
+    """
+    Calculates post-collision velocities for a simplified elastic collision.
+    Assumes ball2 is initially stationary. Uses floats for calculations.
+    ball1_pos_rad: Tuple (x1, y1, r1) - ints
+    ball2_pos_rad: Tuple (x2, y2, r2) - ints
+    initial_velocity_ball1: Tuple (vx1, vy1) - floats
+    Returns: (velocity_ball1_after, velocity_ball2_after) tuples (vx, vy) - floats
+    """
+    x1, y1, r1 = map(float, ball1_pos_rad)
+    x2, y2, r2 = map(float, ball2_pos_rad)
+    v1x, v1y = map(float, initial_velocity_ball1)
+    v2x, v2y = 0.0, 0.0 # Assume target ball is stationary
+
+    # Use radius as a proxy for mass (m = k*r^3, but for simplicity m=r often used)
+    # Or assume equal mass if radii are similar
+    m1 = r1 if r1 > 0.1 else 1.0 # Avoid zero mass
+    m2 = r2 if r2 > 0.1 else 1.0
+    # Or simply: m1, m2 = 1.0, 1.0
+
+    # Vector connecting centers (collision normal)
+    dx = x2 - x1
+    dy = y2 - y1
+    dist = math.sqrt(dx**2 + dy**2)
+
+    if dist < sys.float_info.epsilon: # Avoid division by zero if centers are identical
+        print("Warning: Collision handler called with overlapping balls.")
+        return (0.0, 0.0), (0.0, 0.0)
+
+    # Normalized collision normal vector (nx, ny)
+    nx = dx / dist
+    ny = dy / dist
+    # Tangent vector (tx, ty) - perpendicular to normal
+    tx = -ny
+    ty = nx
+
+    # Project initial velocities onto normal and tangent vectors
+    v1n = v1x * nx + v1y * ny
+    v1t = v1x * tx + v1y * ty
+    v2n = v2x * nx + v2y * ny
+    v2t = v2x * tx + v2y * ty
+
+    # Calculate post-collision velocities along the normal (tangential velocities remain the same)
+    # Using 1D elastic collision formulas along the normal axis
+    v1n_after = ((m1 - m2) * v1n + 2.0 * m2 * v2n) / (m1 + m2)
+    v2n_after = ((m2 - m1) * v2n + 2.0 * m1 * v1n) / (m1 + m2)
+
+    # Convert post-collision normal/tangent velocities back to Cartesian (x, y)
+    v1fx = v1n_after * nx + v1t * tx
+    v1fy = v1n_after * ny + v1t * ty
+    v2fx = v2n_after * nx + v2t * tx
+    v2fy = v2n_after * ny + v2t * ty
+
+    return (v1fx, v1fy), (v2fx, v2fy)
+
+
+def simulate_ball_movement(start_point, initial_velocity, table_x1, table_y1, table_x2, table_y2, ball_radius=DEFAULT_BALL_RADIUS, damping=SIM_MOVEMENT_DAMPING, max_steps=SIM_MAX_STEPS_MOVEMENT):
+    """
+    Simulates a single ball's movement with wall reflections and damping.
+    Uses floats for simulation, returns path as list of int tuples.
+    """
+    path = [start_point] # Store path as ints
+    # Use float for simulation steps
+    current_x, current_y = map(float, start_point)
+    vx, vy = map(float, initial_velocity)
+    f_ball_radius = float(ball_radius)
+    f_damping = float(damping)
+
+    # Use float table boundaries
+    f_table_x1 = float(table_x1)
+    f_table_y1 = float(table_y1)
+    f_table_x2 = float(table_x2)
+    f_table_y2 = float(table_y2)
+
+    for _ in range(max_steps):
+        next_x = current_x + vx
+        next_y = current_y + vy
+
+        # Apply damping to velocity components
+        vx *= f_damping
+        vy *= f_damping
+
+        # Check for wall collisions and reflect velocity
+        if next_x <= f_table_x1 + f_ball_radius:
+            vx *= -1.0 # Reflect X velocity
+            next_x = f_table_x1 + f_ball_radius + float(SIM_WALL_COLLISION_OFFSET)
+        elif next_x >= f_table_x2 - f_ball_radius:
+            vx *= -1.0
+            next_x = f_table_x2 - f_ball_radius - float(SIM_WALL_COLLISION_OFFSET)
+
+        if next_y <= f_table_y1 + f_ball_radius:
+            vy *= -1.0 # Reflect Y velocity
+            next_y = f_table_y1 + f_ball_radius + float(SIM_WALL_COLLISION_OFFSET)
+        elif next_y >= f_table_y2 - f_ball_radius:
+            vy *= -1.0
+            next_y = f_table_y2 - f_ball_radius - float(SIM_WALL_COLLISION_OFFSET)
+
+        # Update position
+        current_x, current_y = next_x, next_y
+        path.append((int(current_x), int(current_y))) # Store as int tuple
+
+        # Stop simulation if speed is very low
+        speed_sq = vx**2 + vy**2
+        if speed_sq < SIM_MIN_SPEED_THRESHOLD**2:
+            break
+
+    return path
+
+def main():
+    """Main function to process the pool table image."""
+    image_path = "1.png" # Consider making this a command-line argument
+    try:
+        image = load_image(image_path)
+        image_with_overlays = image.copy() # Work on a copy for drawing
+
+        # 1. Detect Table Boundaries
+        table_x1, table_y1, table_x2, table_y2 = detect_inner_blue_area(image)
+        print(f"Table Boundaries (Inner Play Area): ({table_x1}, {table_y1}) to ({table_x2}, {table_y2})")
+        draw_rectangle(image_with_overlays, table_x1, table_y1, table_x2, table_y2)
+
+        # 2. Detect All Balls (Colored) within ROI
+        # Returns balls as list of tuples [(x_roi, y_roi, r), ...] with standard ints
+        detected_balls_roi = detect_balls(image, table_x1, table_y1, table_x2, table_y2)
+
+        # 3. Detect White Ball within ROI
+        # Returns ball as tuple (x_roi, y_roi, r) or None, with standard ints
+        white_ball_roi = detect_white_ball(image, table_x1, table_y1, table_x2, table_y2)
+
+        # Convert ball coordinates to global image coordinates and store radius (as ints)
+        white_ball_global = None
+        if white_ball_roi is not None:
+            # white_ball_roi is already (int, int, int)
+            wb_x_roi, wb_y_roi, wb_r = white_ball_roi
+            white_ball_global = (wb_x_roi + table_x1, wb_y_roi + table_y1, wb_r)
+            print(f"Detected White Ball @ Global: ({white_ball_global[0]}, {white_ball_global[1]}), Radius: {white_ball_global[2]}")
+            draw_crosshair(image_with_overlays, white_ball_global[:2], radius=white_ball_global[2])
+        else:
+            print("White ball not detected.")
+            # Optionally exit or handle case where white ball is essential
+            # return
+
+        # Convert colored ball coordinates to global and filter out the white ball (if detected)
+        other_balls_global = []
+        # Use the corrected check for non-empty list/array
+        if len(detected_balls_roi) > 0:
+            for ball_roi in detected_balls_roi: # ball_roi is (int, int, int)
+                b_x_roi, b_y_roi, b_r = ball_roi
+                b_global = (b_x_roi + table_x1, b_y_roi + table_y1, b_r)
+                # Check if this ball is significantly different from the detected white ball
+                is_white = False
+                if white_ball_global:
+                    dist_to_white = distance(b_global[:2], white_ball_global[:2])
+                    # If centers are very close, assume it's the same ball detected by both methods
+                    if dist_to_white < (float(b_r + white_ball_global[2])) * 0.5 : # Threshold for overlap
+                        is_white = True
+
+                if not is_white:
+                    other_balls_global.append(b_global) # Appends tuple of ints
+
+            print(f"Detected {len(other_balls_global)} Other Balls (Global Coords & Radius): {other_balls_global}")
+            # Draw all *originally* detected balls (ROI coords) before filtering white one out
+            draw_detected_balls(image_with_overlays, detected_balls_roi, table_x1, table_y1)
+        else:
+            print("No colored balls detected by detect_balls function.")
+
+        # 4. Detect Cue Stick Direction
+        cue_stick_line = None
+        cue_stick_direction_point = None
+        if white_ball_global:
+            # Pass white ball center (int tuple)
+            cue_stick_line = detect_cue_stick(image, white_ball_global[:2])
+            if cue_stick_line:
+                cue_start, cue_end = cue_stick_line # These are int tuples
+                cue_stick_direction_point = cue_end # Use the endpoint for direction calculation
+                print(f"Detected Cue Stick Direction: From {cue_start} towards {cue_end}")
+                # Draw the short segment used for direction detection
+                cv2.line(image_with_overlays, cue_start, cue_end, CUE_STICK_COLOR, CUE_STICK_THICKNESS)
+
+                # --- Draw extended debug line ---
+                dx = cue_end[0] - cue_start[0]
+                dy = cue_end[1] - cue_start[1]
+                norm = math.sqrt(dx**2 + dy**2)
+                if norm > sys.float_info.epsilon:
+                    # Calculate a point far along the line (e.g., 1000 pixels)
+                    far_x = int(float(cue_start[0]) + (float(dx) / norm) * 1000.0)
+                    far_y = int(float(cue_start[1]) + (float(dy) / norm) * 1000.0)
+                    # Draw the extended line
+                    print(f"    Drawing extended debug line from {cue_start} to ({far_x}, {far_y})") # Debug print
+                    cv2.line(image_with_overlays, cue_start, (far_x, far_y), CUE_DEBUG_LINE_COLOR, CUE_DEBUG_LINE_THICKNESS)
+                # --- End extended debug line ---
+            else:
+                print("Cue stick not detected.")
+
+
+        # 5. Find Target Ball and Simulate Trajectory
+        if white_ball_global and cue_stick_direction_point and other_balls_global:
+            white_ball_center = white_ball_global[:2] # (int, int)
+            white_ball_radius = white_ball_global[2] # int
+
+            # Find the ball the cue seems to be aiming at (expects int tuples, returns int tuple or None)
+            target_ball_data = find_target_ball(white_ball_center, cue_stick_direction_point, other_balls_global, ball_radius=white_ball_radius)
+
+            if target_ball_data: # target_ball_data is (int, int, int) or None
+                target_center = target_ball_data[:2]
+                target_radius = target_ball_data[2]
+                print(f"Identified Target Ball @ Global: {target_center}, Radius: {target_radius}")
+                draw_crosshair(image_with_overlays, target_center, radius=target_radius, color=TARGET_CROSSHAIR_COLOR)
+
+                # Simulate trajectory from cue ball towards the target ball's center
+                # Exclude the target ball itself from the collision obstacles for this primary path
+                # Ensure obstacle coords are ints
+                obstacles_for_primary_path = [b for b in other_balls_global if tuple(map(int, b[:2])) != tuple(map(int, target_center))]
+
+                # simulate_trajectory expects int inputs, returns list of int tuples
+                trajectory_to_target = simulate_trajectory(white_ball_center, target_center,
+                                                         table_x1, table_y1, table_x2, table_y2,
+                                                         obstacles_for_primary_path, ball_radius=white_ball_radius)
+                print(f"Simulated Trajectory to Target: {len(trajectory_to_target)} points")
+                draw_trajectory(image_with_overlays, trajectory_to_target, color=TRAJECTORY_COLOR)
+
+                # Check if the trajectory actually reached (or got very close to) the target ball
+                if trajectory_to_target:
+                    final_point = trajectory_to_target[-1] # int tuple
+                    dist_to_target_at_end = distance(final_point, target_center)
+
+                    # Threshold distance to consider it a "hit"
+                    collision_threshold = (float(white_ball_radius) + float(target_radius)) * 1.1 # Allow slight overlap
+
+                    if dist_to_target_at_end < collision_threshold:
+                        print("Trajectory indicates collision with target ball.")
+                        # Simulate cue ball path *after* collision
+
+                        # Calculate impact direction using float for precision
+                        impact_dir_x = float(target_center[0]) - float(white_ball_center[0])
+                        impact_dir_y = float(target_center[1]) - float(white_ball_center[1])
+                        impact_norm = math.sqrt(impact_dir_x**2 + impact_dir_y**2)
+                        initial_speed = 15.0 # Adjust as needed
+                        if impact_norm > sys.float_info.epsilon:
+                           cue_initial_vx = initial_speed * impact_dir_x / impact_norm
+                           cue_initial_vy = initial_speed * impact_dir_y / impact_norm
+                        else:
+                           cue_initial_vx, cue_initial_vy = 0.0, 0.0
+
+                        # handle_collision expects int tuples for pos/rad, float tuple for velocity
+                        cue_vel_after, target_vel_after = handle_collision(
+                            white_ball_global, target_ball_data, (cue_initial_vx, cue_initial_vy)
+                        ) # Returns float velocities
+                        print(f"  Post-collision Cue Velocity: ({cue_vel_after[0]:.2f}, {cue_vel_after[1]:.2f})")
+                        print(f"  Post-collision Target Velocity: ({target_vel_after[0]:.2f}, {target_vel_after[1]:.2f})") # Target velocity is calculated but not simulated by default
+
+                        # Simulate cue ball's path starting from near the collision point with its new velocity
+                        cue_ball_start_reflection = final_point # int tuple
+                        # simulate_ball_movement expects int start, float velocity, returns list of int tuples
+                        cue_ball_reflection_path = simulate_ball_movement(
+                            cue_ball_start_reflection, cue_vel_after,
+                            table_x1, table_y1, table_x2, table_y2,
+                            ball_radius=white_ball_radius
+                        )
+                        print(f"Simulated Cue Ball Reflection Path: {len(cue_ball_reflection_path)} points")
+                        draw_trajectory(image_with_overlays, cue_ball_reflection_path, color=REFLECTION_COLOR)
+                    else:
+                        print(f"Trajectory ended at {final_point}, {dist_to_target_at_end:.2f} from target center {target_center}. Threshold: {collision_threshold:.2f}. No collision.")
+            else:
+                print("No specific target ball identified along the cue direction.")
+                # Simulate trajectory just along the cue stick line if no target found
+                # simulate_trajectory expects int inputs
+                trajectory_no_target = simulate_trajectory(white_ball_center, cue_stick_direction_point,
+                                                        table_x1, table_y1, table_x2, table_y2,
+                                                        other_balls_global, ball_radius=white_ball_radius)
+                draw_trajectory(image_with_overlays, trajectory_no_target, color=TRAJECTORY_COLOR)
+
+
+        # 6. Display or Save Result
+        output_option = "display" # Choose "display" or "save"
+
+        if output_option == "display":
+            cv2.imshow("Pool Ball Detection and Trajectory Simulation", image_with_overlays)
+            print("\nPress any key in the image window to close.")
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+        elif output_option == "save":
+            output_image_path = "output_pool_simulation.png"
+            cv2.imwrite(output_image_path, image_with_overlays)
+            print(f"\nOutput image with overlays saved to: {output_image_path}")
+        else:
+             print("Invalid output_option selected.")
+
+    except ValueError as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+    except Exception as e: # Catch other potential errors
+        print(f"An unexpected error occurred: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
